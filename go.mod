@@ -3,6 +3,7 @@ module github.com/google/wire
 go 1.12
 
 require (
+	github.com/emicklei/dot v0.16.0 // indirect
 	github.com/google/go-cmp v0.2.0
 	github.com/google/subcommands v1.2.0
 	github.com/pmezard/go-difflib v1.0.0

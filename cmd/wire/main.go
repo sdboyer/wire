@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/emicklei/dot"
 	"github.com/google/subcommands"
 	"github.com/google/wire/internal/wire"
 	"github.com/pmezard/go-difflib/difflib"
@@ -45,6 +46,7 @@ func main() {
 	subcommands.Register(&diffCmd{}, "")
 	subcommands.Register(&genCmd{}, "")
 	subcommands.Register(&showCmd{}, "")
+	subcommands.Register(&dotCmd{}, "")
 	flag.Parse()
 
 	// Initialize the default logger to log to stderr.
@@ -64,6 +66,7 @@ func main() {
 		"diff":     true,
 		"gen":      true,
 		"show":     true,
+		"dot":      true,
 	}
 	// Default to running the "gen" command.
 	if args := flag.Args(); len(args) == 0 || !allCmds[args[0]] {
@@ -350,6 +353,212 @@ func (cmd *showCmd) Execute(ctx context.Context, f *flag.FlagSet, args ...interf
 		return subcommands.ExitFailure
 	}
 	return subcommands.ExitSuccess
+}
+
+type dotCmd struct {
+	tags string
+	set  string
+}
+
+func (*dotCmd) Name() string { return "dot" }
+func (*dotCmd) Synopsis() string {
+	return "emit graphviz dot of a provider set's dependency relations"
+}
+func (*dotCmd) Usage() string {
+	return `dot [package] [provider-set]
+
+  Given a package and the name of a top-level variable containing a provider
+  set, dot outputs a graphviz dot-format text file that can be translated into a 
+  dependency graph of all providers.
+`
+}
+func (cmd *dotCmd) SetFlags(f *flag.FlagSet) {
+	f.StringVar(&cmd.tags, "tags", "", "append build tags to the default wirebuild")
+	f.StringVar(&cmd.set, "provider-set", "", "name of provider set var to dump")
+}
+
+func (cmd *dotCmd) Execute(ctx context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+	wd, err := os.Getwd()
+	if err != nil {
+		log.Println("failed to get working directory: ", err)
+		return subcommands.ExitFailure
+	}
+	if cmd.set == "" {
+		log.Println("must provide the name of a variable containing a wire Provider set")
+		return subcommands.ExitFailure
+	}
+
+	info, errs := wire.Load(ctx, wd, os.Environ(), cmd.tags, packages(f))
+	if info != nil {
+		keys := make([]wire.ProviderSetID, 0, len(info.Sets))
+		for k := range info.Sets {
+			keys = append(keys, k)
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			if keys[i].ImportPath == keys[j].ImportPath {
+				return keys[i].VarName < keys[j].VarName
+			}
+			return keys[i].ImportPath < keys[j].ImportPath
+		})
+
+		blacklist := map[string]bool{
+			// "github.com/grafana/grafana/pkg/models.Licensing":        true,
+			// "github.com/grafana/grafana/pkg/setting.CommandLineArgs": true,
+		}
+
+		gathered := make(map[string][]outGroup)
+		var include []string
+		// Figure out which all sets to dump
+		for _, k := range keys {
+			og, imports := gather(info, k)
+			gathered[k.VarName] = og
+
+			if k.VarName == cmd.set {
+				include = []string{k.VarName}
+				for _, imp := range sortSet(imports) {
+					include = append(include, imp[strings.LastIndexAny(imp, ".")+1:])
+				}
+			}
+		}
+		if len(include) == 0 {
+			log.Printf("no variable found with name %q", cmd.set)
+		}
+
+		// var ccount int
+		// _ = ccount
+		g := dot.NewGraph(dot.Directed)
+		g.ID(cmd.set)
+		g.Attr("layout", "twopi")
+		g.Attr("overlap", "false")
+		g.Attr("splines", "spline")
+		isdep := make(map[string]bool)
+		// g.Attr("layout", "fdp")
+		// g.Attr("overlap", "false")
+		// for _, k := range keys {
+		// cluster := g.Subgraph(k.VarName)
+		for _, name := range include {
+			outGroups, has := gathered[name]
+			if !has {
+				log.Println("no groups for", name)
+				return subcommands.ExitFailure
+			}
+			// g := dot.NewGraph(dot.Directed)
+			// allGraphs[k.VarName] = g.ID(k.VarName)
+			// g.Attr("layout", "twopi")
+			// g.Attr("overlap", "false")
+			// g.Attr("splines", "spline")
+
+			g.NodeInitializer(func(n dot.Node) {
+				n.Attr("shape", "rect")
+			})
+
+			// outGroups, imports := gather(info, k)
+			// TODO ignoring these set-level imports for now, but they matter
+			// _ = imports
+			// for _, imp := range sortSet(imports) {
+			// 	fmt.Printf("\t%s\n", imp)
+			// }
+
+			for i := range outGroups {
+				// var cluster *dot.Graph
+				// if outGroups[i].name == "no inputs" {
+				// 	cluster = g.Subgraph("root", dot.ClusterOption{})
+				// } else {
+				// 	cluster = g.Subgraph(fmt.Sprintf("cluster_%v", ccount))
+				// 	ccount++
+				// }
+				// cluster.Attr("color", "blue")
+
+				var tolist []dot.Node
+				outGroups[i].inputs.Iterate(func(k types.Type, _ interface{}) {
+					id := types.TypeString(k, nil)
+					to := g.Node(id)
+					if !blacklist[id] {
+						tolist = append(tolist, to)
+					}
+					isdep[id] = true
+				})
+
+				// fmt.Printf("\tOutputs given %s:\n", outGroups[i].name)
+				// out := make(map[string]token.Pos, outGroups[i].outputs.Len())
+				outGroups[i].outputs.Iterate(func(t types.Type, v interface{}) {
+					id := types.TypeString(t, nil)
+					// if strings.Contains(id, "tsdb") {
+					// 	return
+					// }
+					from := g.Node(id)
+					for _, to := range tolist {
+						// cluster.Edge(from, to)
+						g.Edge(from, to)
+					}
+					// TODO differentiate
+					// switch v.(type) {
+					// case *wire.Provider:
+					// 	cluster.Node(types.TypeString(t, nil))
+					// case *wire.Value:
+					// 	cluster.Node(types.TypeString(t, nil))
+					// case *wire.Field:
+					// 	cluster.Node(types.TypeString(t, nil))
+					// default:
+					// 	panic("unreachable")
+					// }
+				})
+				// for _, t := range sortSet(out) {
+				// 	fmt.Printf("\t\t%s\n", t)
+				// 	fmt.Printf("\t\t\tat %v\n", info.Fset.Position(out[t]))
+				// }
+			}
+
+		}
+
+		notdep := make(map[string]bool)
+		g.VisitNodes(func(n dot.Node) bool {
+			if !isdep[nid(n)] {
+				notdep[nid(n)] = true
+			}
+			return false
+		})
+		// for id := range notdep {
+		// 	g.DeleteNode(id)
+		// }
+		fmt.Println(g)
+		// if len(info.Injectors) > 0 {
+		// 	injectors := append([]*wire.Injector(nil), info.Injectors...)
+		// 	sort.Slice(injectors, func(i, j int) bool {
+		// 		if injectors[i].ImportPath == injectors[j].ImportPath {
+		// 			return injectors[i].FuncName < injectors[j].FuncName
+		// 		}
+		// 		return injectors[i].ImportPath < injectors[j].ImportPath
+		// 	})
+		// 	fmt.Println("\nInjectors:")
+		// 	for _, in := range injectors {
+		// 		fmt.Printf("\t%v\n", in)
+		// 	}
+		// }
+		// fmt.Println(g)
+	}
+	if len(errs) > 0 {
+		logErrors(errs)
+		log.Println("error loading packages")
+		return subcommands.ExitFailure
+	}
+	return subcommands.ExitSuccess
+}
+
+func nid(n dot.Node) string {
+	return n.AttributesMap.Value("label").(string)
+}
+
+// Merges the rest of the provided graphs onto the first graph. No return value;
+// the first graph is mutated.
+func mergeDotGraphs(b *dot.Graph, gs ...*dot.Graph) {
+	for _, g := range gs {
+		g.VisitNodes(func(n dot.Node) bool {
+			id := n.AttributesMap.Value("label").(string)
+			b.Node(id)
+			return false
+		})
+	}
 }
 
 type checkCmd struct {
